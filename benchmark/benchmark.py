@@ -8,9 +8,9 @@ from utils import create_snowflake_connection
 from utils import create_embucket_connection
 from tpch import parametrize_tpch_queries
 from docker_manager import create_docker_manager
+from constants import SystemType
 
 from dotenv import load_dotenv
-from enum import Enum
 import csv
 import argparse
 
@@ -24,34 +24,29 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class SystemType(Enum):
-    EMBUCKET = "embucket"
-    SNOWFLAKE = "snowflake"
-
-
-def get_results_path(platform: str, benchmark_type: str, scale_factor: str,
+def get_results_path(system: SystemType, benchmark_type: str, scale_factor: str,
                      warehouse_or_instance: str, run_number: Optional[int] = None) -> str:
     """Generate path for storing benchmark results."""
-    if platform.lower() == "snowflake":
+    if system == SystemType.SNOWFLAKE:
         base_path = f"result/snowflake_{benchmark_type}_results/{scale_factor}/{warehouse_or_instance}"
-    elif platform.lower() == "embucket":
+    elif system == SystemType.EMBUCKET:
         base_path = f"result/embucket_{benchmark_type}_results/{scale_factor}/{warehouse_or_instance}"
     else:
-        raise ValueError(f"Unsupported platform: {platform}")
+        raise ValueError(f"Unsupported system: {system}")
 
     if run_number is not None:
-        return f"{base_path}/{platform.lower()}_results_run_{run_number}.csv"
+        return f"{base_path}/{system.value}_results_run_{run_number}.csv"
     return base_path
 
 
-def save_results_to_csv(results, filename="query_results.csv", platform=None):
+def save_results_to_csv(results, filename="query_results.csv", system=None):
     """
     Save benchmark results to CSV file with standardized headers.
 
     Args:
         results: The query results to save
         filename: Path to save the CSV file
-        platform: The platform type ("snowflake" or "embucket")
+        system: The system type (SystemType.SNOWFLAKE or SystemType.EMBUCKET)
     """
     headers = ["Query", "Query ID", "Total (ms)", "Rows"]
 
@@ -59,13 +54,13 @@ def save_results_to_csv(results, filename="query_results.csv", platform=None):
         writer = csv.writer(f)
         writer.writerow(headers)
 
-        if platform == "embucket":
+        if system == SystemType.EMBUCKET:
             # Embucket results format
             query_results, total_time = results
             for row in query_results:
                 writer.writerow([row[0], row[1], row[2], row[3]])
             writer.writerow(["TOTAL", "", total_time, ""])
-        elif platform == "snowflake":
+        elif system == SystemType.SNOWFLAKE:
             # Snowflake results format with simplified query
             total_time = 0
             for row in results:
@@ -293,9 +288,9 @@ def run_snowflake_benchmark(run_number: int):
 
     sf_results = run_on_sf(sf_cursor,warehouse, queries)
 
-    results_path = get_results_path("snowflake", benchmark_type, scale_factor, warehouse, run_number)
+    results_path = get_results_path(SystemType.SNOWFLAKE, benchmark_type, scale_factor, warehouse, run_number)
     os.makedirs(os.path.dirname(results_path), exist_ok=True)
-    save_results_to_csv(sf_results, filename=results_path, platform="snowflake")
+    save_results_to_csv(sf_results, filename=results_path, system=SystemType.SNOWFLAKE)
 
     logger.info(f"Snowflake benchmark results saved to: {results_path}")
 
@@ -303,7 +298,7 @@ def run_snowflake_benchmark(run_number: int):
     sf_connection.close()
 
     # Check if we have 3 CSV files ready and calculate averages if so
-    results_dir = get_results_path("snowflake", benchmark_type, scale_factor, warehouse)
+    results_dir = get_results_path(SystemType.SNOWFLAKE, benchmark_type, scale_factor, warehouse)
     csv_files = glob.glob(os.path.join(results_dir, "snowflake_results_run_*.csv"))
     if len(csv_files) == 3:
         logger.info("Found 3 CSV files. Calculating averages...")
@@ -335,14 +330,13 @@ def run_embucket_benchmark(run_number: int):
     # Run benchmark
     emb_results = run_on_emb(docker_manager, queries)
 
-    results_path = get_results_path("embucket", benchmark_type, scale_factor, instance, run_number)
+    results_path = get_results_path(SystemType.EMBUCKET, benchmark_type, scale_factor, instance, run_number)
     os.makedirs(os.path.dirname(results_path), exist_ok=True)
-    save_results_to_csv(emb_results, filename=results_path, platform="embucket")
-
+    save_results_to_csv(emb_results, filename=results_path, system=SystemType.EMBUCKET)
     logger.info(f"Embucket benchmark results saved to: {results_path}")
 
     # Check if we have 3 CSV files ready and calculate averages
-    results_dir = get_results_path("embucket", benchmark_type, scale_factor, instance)
+    results_dir = get_results_path(SystemType.EMBUCKET, benchmark_type, scale_factor, instance)
     csv_files = glob.glob(os.path.join(results_dir, "embucket_results_run_*.csv"))
     if len(csv_files) == 3:
         logger.info("Found 3 CSV files. Calculating averages...")
