@@ -93,6 +93,7 @@ impl RunOpt {
             &session,
         )
         .await?;
+
         // Turn on Parquet filter pushdown if requested
         if self.common.pushdown {
             set_session_variable_bool("execution.parquet.pushdown_filters", true, &session).await?;
@@ -133,6 +134,14 @@ impl RunOpt {
             &session,
         )
         .await?;
+
+        if self.common.use_duckdb {
+            let mut query = session.query(
+                "SET embucket.execution.acceleration = true",
+                query_context(),
+            );
+            query.execute().await?;
+        }
 
         let mut millis = vec![];
         // run benchmark
