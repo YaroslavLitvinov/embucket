@@ -18,6 +18,7 @@ use crate::datafusion::physical_plan::merge::{
     DATA_FILE_PATH_COLUMN, MANIFEST_FILE_PATH_COLUMN, SOURCE_EXISTS_COLUMN, TARGET_EXISTS_COLUMN,
 };
 use crate::datafusion::rewriters::session_context::SessionContextExprRewriter;
+use crate::duckdb::{execute_duck_db_explain, is_select_statement};
 use crate::error::{OperationOn, OperationType};
 use crate::models::{QueryContext, QueryResult};
 use core_history::HistoryStore;
@@ -168,6 +169,13 @@ impl UserQuery {
         Ok(statement)
     }
 
+    pub fn statement(&self) -> std::result::Result<DFStatement, DataFusionError> {
+        let state = self.session.ctx.state();
+        let dialect = state.config().options().sql_parser.dialect.as_str();
+        let statement = state.sql_to_statement(&self.raw_query, dialect)?;
+        Ok(statement)
+    }
+
     pub async fn plan(&self) -> std::result::Result<LogicalPlan, DataFusionError> {
         let statement = self.parse_query()?;
         self.session.ctx.state().statement_to_plan(statement).await
@@ -307,8 +315,6 @@ impl UserQuery {
         err
     )]
     pub async fn execute(&mut self) -> Result<QueryResult> {
-        let statement = self.parse_query().context(ex_error::DataFusionSnafu)?;
-
         // If the config or session variable "use_duck_db" is set, we bypass DataFusion entirely
         // and execute the full SQL query directly using DuckDB in-memory engine.
         // This is typically used for heavy or complex queries that DataFusion handles poorly,
@@ -316,12 +322,20 @@ impl UserQuery {
         if self.session.config.use_duck_db
             || self
                 .session
-                .get_session_variable("embucket.execution.acceleration")
-                .is_some()
+                .get_session_variable_bool("embucket.execution.acceleration")
         {
-            return self.execute_duck_db(statement).await;
+            let raw_statement = self.statement().context(ex_error::DataFusionSnafu)?;
+            // Allow only SELECT statements for DuckDB acceleration mode
+            if is_select_statement(&raw_statement) {
+                // If DuckDB execution fails for any reason (unsupported syntax, internal error, etc.),
+                // we fall back to the default Embucket execution path below.
+                if let Ok(result) = self.execute_duck_db(raw_statement).await {
+                    return Ok(result);
+                }
+            }
         }
 
+        let statement = self.parse_query().context(ex_error::DataFusionSnafu)?;
         self.query = statement.to_string();
 
         // Record the result as part of the current span.
@@ -486,21 +500,31 @@ impl UserQuery {
     pub async fn execute_duck_db(&mut self, mut statement: DFStatement) -> Result<QueryResult> {
         // Fully qualify all table references
         self.update_statement_references(&mut statement)?;
-        let plan = self.statement_to_plan(&statement).await?;
-        let schema = plan.schema().inner().clone();
 
         // Convert already resolved table references to iceberg_scan function call
         let setup_queries = self.update_iceberg_scan_references(&mut statement).await?;
         self.query = statement.to_string();
+        let sql = self.query.clone();
 
         let duckdb_pool = Arc::new(
             DuckDbConnectionPool::new_memory()
                 .context(ex_error::DuckdbConnectionPoolSnafu)?
                 .with_connection_setup_queries(setup_queries),
         );
-        let stream = get_stream(duckdb_pool, self.query.clone(), schema.clone())
+
+        if self.session.config.use_duck_db_explain
+            || self
+                .session
+                .get_session_variable_bool("embucket.execution.explain_before_acceleration")
+        {
+            // Check if possible to call duckdb with this query
+            let _explain_result = execute_duck_db_explain(duckdb_pool.clone(), &sql).await?;
+        }
+
+        let stream = get_stream(duckdb_pool, sql, Arc::new(ArrowSchema::empty()))
             .await
             .context(ex_error::DataFusionSnafu)?;
+        let schema = stream.schema().clone();
         let records = stream
             .try_collect::<Vec<_>>()
             .await
