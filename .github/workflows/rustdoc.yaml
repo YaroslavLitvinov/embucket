@@ -1,34 +1,25 @@
-name: rustdoc comments
-
-on: 
-  workflow_dispatch:
-
-# You may specify the type of PR that triggers the action
-  pull_request:
-  #or
-  issue_comment: #issue_comments is writing @patchdog inside the issue body, which is encouraged, so actual discussions do not trigger it.
-
+name: Patchdog
+#Best resort is calling patchdog once, when last commit is pushed into HEAD branch
+on:
+  issue_comment:
+    types: [created]
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   run_patchdog:
-#only linux is supported, but many flavors, as patchdog binaries are statically linked
-    # if is used for on: issue_comment, otherwise it is not required
-    if: | 
-      github.event.issue.pull_request != '' && contains(github.event.comment.body, '@patchdog') 
+    if: |
+      github.event.issue.pull_request != '' && contains(github.event.comment.body, '@patchdog')
+
     runs-on: ubuntu-latest
-#these are the permission without which the actions wouldn't work
     permissions: 
       contents: write
       pull-requests: write
 
     steps:
-      - name: Run Patchdog action
-        uses: YuraLitvinov/patchdog@1.2.62 # marketplace-defined path. Latest is for on: issue_comment, given the fact that configuration is stable, patchdog with pull_request trigger (v1.2.62) will always use the latest available binary. Release note post-v1.2.70 is redundant, as it would match the said version and trigger on issue_comment
-        with: 
-#only crucial variables are being passed to patchdog in this case 
-#you may as well change commit author signature by default it is Patchdog, some@email.com and specify path to config.yaml
+      - name: Patchdog
+        uses: YuraLitvinov/patchdog@v1.2.62
+        with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           api_key_gemini: ${{ secrets.API_KEY_GEMINI }}
