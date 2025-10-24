@@ -4,7 +4,7 @@ use std::{collections::HashMap, sync::Arc};
 use crate::models::*;
 use crate::{
     Metastore,
-    error::{self as metastore_error, Result},
+    error::{self as metastore_err, Result},
     models::{
         RwObject,
         database::{Database, DatabaseIdent},
@@ -16,8 +16,10 @@ use crate::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
+use core_sqlite::SqliteDb;
 use core_utils::Db;
 use core_utils::scan_iterator::{ScanIterator, VecScanIterator};
+use rusqlite::Result as SqlResult;
 use dashmap::DashMap;
 use futures::{StreamExt, TryStreamExt};
 use iceberg_rust::catalog::commit::{TableUpdate as IcebergTableUpdate, apply_table_updates};
@@ -32,6 +34,23 @@ use snafu::ResultExt;
 use strum::Display;
 use tracing::instrument;
 use uuid::Uuid;
+
+pub const SQLITE_METASTORE_DB_NAME: &str = "sqlite_data/metastore.db";
+
+
+const METASTORE_TABLES_CREATE_TABLE: &str = "
+CREATE TABLE IF NOT EXISTS tables (
+    ident TEXT PRIMARY KEY,              -- Table identifier (UUID or unique string)
+    name TEXT NOT NULL,                  -- Table name
+    metadata TEXT NOT NULL,              -- JSON/text representation of TableMetadata
+    metadata_location TEXT NOT NULL,     -- File or object store path
+    properties TEXT,                     -- Serialized key/value map (JSON)
+    volume_ident TEXT,                   -- Optional UUID or string
+    volume_location TEXT,                -- Optional path
+    is_temporary INTEGER NOT NULL,       -- 0 or 1 (SQLite doesn’t have real BOOLEAN)
+    format TEXT NOT NULL                 -- TableFormat enum as TEXT (parquet, csv, etc.)
+);";
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
 #[strum(serialize_all = "lowercase")]
@@ -61,6 +80,7 @@ const KEY_TABLE: &str = "tbl";
 pub struct SlateDBMetastore {
     db: Db,
     object_store_cache: DashMap<VolumeIdent, Arc<dyn ObjectStore>>,
+    pub sqlite_db: SqliteDb,
 }
 
 impl std::fmt::Debug for SlateDBMetastore {
@@ -70,17 +90,75 @@ impl std::fmt::Debug for SlateDBMetastore {
 }
 
 impl SlateDBMetastore {
-    #[must_use]
-    pub fn new(db: Db) -> Self {
-        Self {
-            db,
-            object_store_cache: DashMap::new(),
+    #[allow(clippy::expect_used)]
+    pub async fn new(db: core_utils::Db) -> Result<Self> {
+        if let Some(dir_path) = std::path::Path::new(SQLITE_METASTORE_DB_NAME).parent() {
+            std::fs::create_dir_all(dir_path).context(metastore_err::CreateDirSnafu)?;
         }
+
+        let metastore = Self {
+            //
+            db: db.clone(), // to be removed
+            object_store_cache: DashMap::new(),  // to be removed
+            //
+            sqlite_db: SqliteDb::new(db.slate_db(), SQLITE_METASTORE_DB_NAME)
+                .await
+                .expect("Failed to initialize sqlite store"),
+        };
+        metastore.create_tables().await?;
+        Ok(metastore)
     }
 
-    // Create a new SlateDBMetastore with a new in-memory database
-    pub async fn new_in_memory() -> Self {
-        Self::new(Db::memory().await)
+   // Create a new store with a new in-memory database
+    #[allow(clippy::expect_used)]
+    pub async fn new_in_memory() -> Self {       
+        let utils_db = core_utils::Db::memory().await;
+
+        // use unique filename for every test, create in memory database
+        let thread = std::thread::current();
+        let thread_name = thread
+            .name()
+            .map_or("<unnamed>", |s| s.split("::").last().unwrap_or("<unnamed>"));
+        let sqlite_db_name = format!("file:{thread_name}_meta?mode=memory");
+        let store = Self {
+            //
+            db: utils_db.clone(), // to be removed
+            object_store_cache: DashMap::new(),  // to be removed
+            //
+            sqlite_db: SqliteDb::new(utils_db.slate_db(), &sqlite_db_name)
+                .await
+                .expect("Failed to create SqliteDb for queries"),
+        };
+        store
+            .create_tables()
+            .await
+            .expect("Failed to create tables");
+        store
+    }
+
+   #[instrument(
+        name = "SqliteMetastore::create_tables",
+        level = "debug",
+        skip(self),
+        fields(ok),
+        err
+    )]
+    pub async fn create_tables(&self) -> Result<()> {
+        let connection = self
+            .sqlite_db
+            .conn()
+            .await
+            .context(metastore_err::CoreSqliteSnafu)?;
+
+        connection.interact(|conn| -> SqlResult<usize> {
+            conn.execute("BEGIN", [])?;
+            conn.execute(METASTORE_TABLES_CREATE_TABLE, [])?;
+            conn.execute("COMMIT", [])
+        }).await?
+        .context(metastore_err::CreateTablesSnafu)?;
+
+        tracing::Span::current().record("ok", true);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -115,17 +193,17 @@ impl SlateDBMetastore {
             .db
             .get::<RwObject<T>>(key)
             .await
-            .context(metastore_error::UtilSlateDBSnafu)?
+            .context(metastore_err::UtilSlateDBSnafu)?
             .is_none()
         {
             let rwobject = RwObject::new(object);
             self.db
                 .put(key, &rwobject)
                 .await
-                .context(metastore_error::UtilSlateDBSnafu)?;
+                .context(metastore_err::UtilSlateDBSnafu)?;
             Ok(rwobject)
         } else {
-            Err(metastore_error::ObjectAlreadyExistsSnafu {
+            Err(metastore_err::ObjectAlreadyExistsSnafu {
                 type_name: object_type.to_string(),
                 name: key.to_string(),
             }
@@ -147,16 +225,16 @@ impl SlateDBMetastore {
             .db
             .get::<RwObject<T>>(key)
             .await
-            .context(metastore_error::UtilSlateDBSnafu)?
+            .context(metastore_err::UtilSlateDBSnafu)?
         {
             rwo.update(object);
             self.db
                 .put(key, &rwo)
                 .await
-                .context(metastore_error::UtilSlateDBSnafu)?;
+                .context(metastore_err::UtilSlateDBSnafu)?;
             Ok(rwo)
         } else {
-            Err(metastore_error::ObjectNotFoundSnafu {}.build())
+            Err(metastore_err::ObjectNotFoundSnafu {}.build())
         }
     }
 
@@ -189,6 +267,22 @@ impl SlateDBMetastore {
         Self::update_properties_timestamps(&mut properties);
         properties
     }
+
+
+    // #[instrument(
+    //     name = "SlateDBMetastore::create_object",
+    //     level = "debug",
+    //     skip(self, object),
+    //     err
+    // )]
+    // async fn create_object<T>(
+    //     &self,
+    //     key: &str,
+    //     object_type: MetastoreObjectType,
+    //     object: T,
+    // ) -> Result<RwObject<T>> {
+
+    // }
 }
 
 #[async_trait]
@@ -210,8 +304,8 @@ impl Metastore for SlateDBMetastore {
             .create_object(&key, MetastoreObjectType::Volume, volume)
             .await
             .map_err(|e| {
-                if matches!(e, metastore_error::Error::ObjectAlreadyExists { .. }) {
-                    metastore_error::VolumeAlreadyExistsSnafu {
+                if matches!(e, metastore_err::Error::ObjectAlreadyExists { .. }) {
+                    metastore_err::VolumeAlreadyExistsSnafu {
                         volume: name.clone(),
                     }
                     .build()
@@ -229,7 +323,7 @@ impl Metastore for SlateDBMetastore {
         self.db
             .get(&key)
             .await
-            .context(metastore_error::UtilSlateDBSnafu)
+            .context(metastore_err::UtilSlateDBSnafu)
     }
 
     #[instrument(
@@ -254,7 +348,7 @@ impl Metastore for SlateDBMetastore {
             .iter_databases()
             .collect()
             .await
-            .context(metastore_error::UtilSlateDBSnafu)?
+            .context(metastore_err::UtilSlateDBSnafu)?
             .into_iter()
             .filter(|db| db.volume == *name)
             .map(|db| db.ident.clone())
@@ -271,7 +365,7 @@ impl Metastore for SlateDBMetastore {
             self.object_store_cache.remove(name);
             Ok(())
         } else {
-            Err(metastore_error::VolumeInUseSnafu {
+            Err(metastore_err::VolumeInUseSnafu {
                 database: databases_using[..].join(", "),
             }
             .build())
@@ -292,7 +386,7 @@ impl Metastore for SlateDBMetastore {
             Ok(Some(store.clone()))
         } else {
             let volume = self.get_volume(name).await?.ok_or_else(|| {
-                metastore_error::VolumeNotFoundSnafu {
+                metastore_err::VolumeNotFoundSnafu {
                     volume: name.clone(),
                 }
                 .build()
@@ -321,7 +415,7 @@ impl Metastore for SlateDBMetastore {
         database: Database,
     ) -> Result<RwObject<Database>> {
         self.get_volume(&database.volume).await?.ok_or_else(|| {
-            metastore_error::VolumeNotFoundSnafu {
+            metastore_err::VolumeNotFoundSnafu {
                 volume: database.volume.clone(),
             }
             .build()
@@ -337,7 +431,7 @@ impl Metastore for SlateDBMetastore {
         self.db
             .get(&key)
             .await
-            .context(metastore_error::UtilSlateDBSnafu)
+            .context(metastore_err::UtilSlateDBSnafu)
     }
 
     #[instrument(
@@ -361,7 +455,7 @@ impl Metastore for SlateDBMetastore {
             .iter_schemas(name)
             .collect()
             .await
-            .context(metastore_error::UtilSlateDBSnafu)?;
+            .context(metastore_err::UtilSlateDBSnafu)?;
         if cascade {
             let futures = schemas
                 .iter()
@@ -369,7 +463,7 @@ impl Metastore for SlateDBMetastore {
                 .collect::<Vec<_>>();
             futures::future::try_join_all(futures).await?;
         } else if !schemas.is_empty() {
-            return Err(metastore_error::DatabaseInUseSnafu {
+            return Err(metastore_err::DatabaseInUseSnafu {
                 database: name,
                 schema: schemas
                     .iter()
@@ -405,7 +499,7 @@ impl Metastore for SlateDBMetastore {
             self.create_object(&key, MetastoreObjectType::Schema, schema)
                 .await
         } else {
-            Err(metastore_error::DatabaseNotFoundSnafu {
+            Err(metastore_err::DatabaseNotFoundSnafu {
                 db: ident.database.clone(),
             }
             .build())
@@ -418,7 +512,7 @@ impl Metastore for SlateDBMetastore {
         self.db
             .get(&key)
             .await
-            .context(metastore_error::UtilSlateDBSnafu)
+            .context(metastore_err::UtilSlateDBSnafu)
     }
 
     #[instrument(
@@ -438,7 +532,7 @@ impl Metastore for SlateDBMetastore {
             .iter_tables(ident)
             .collect()
             .await
-            .context(metastore_error::UtilSlateDBSnafu)?;
+            .context(metastore_err::UtilSlateDBSnafu)?;
         if cascade {
             let futures = tables
                 .iter()
@@ -496,13 +590,13 @@ impl Metastore for SlateDBMetastore {
                 )
             } else {
                 let database = self.get_database(&ident.database).await?.ok_or_else(|| {
-                    metastore_error::DatabaseNotFoundSnafu {
+                    metastore_err::DatabaseNotFoundSnafu {
                         db: ident.database.clone(),
                     }
                     .build()
                 })?;
                 let volume = self.get_volume(&database.volume).await?.ok_or_else(|| {
-                    metastore_error::VolumeNotFoundSnafu {
+                    metastore_err::VolumeNotFoundSnafu {
                         volume: database.volume.clone(),
                     }
                     .build()
@@ -551,7 +645,7 @@ impl Metastore for SlateDBMetastore {
 
             let table_metadata = table_metadata
                 .build()
-                .context(metastore_error::TableMetadataBuilderSnafu)?;
+                .context(metastore_err::TableMetadataBuilderSnafu)?;
 
             let mut table_properties = table.properties.unwrap_or_default().clone();
             Self::update_properties_timestamps(&mut table_properties);
@@ -571,7 +665,7 @@ impl Metastore for SlateDBMetastore {
                 .await?;
 
             let object_store = self.table_object_store(ident).await?.ok_or_else(|| {
-                metastore_error::TableObjectStoreNotFoundSnafu {
+                metastore_err::TableObjectStoreNotFoundSnafu {
                     table: ident.table.clone(),
                     schema: ident.schema.clone(),
                     db: ident.database.clone(),
@@ -579,19 +673,19 @@ impl Metastore for SlateDBMetastore {
                 .build()
             })?;
             let data = Bytes::from(
-                serde_json::to_vec(&table_metadata).context(metastore_error::SerdeSnafu)?,
+                serde_json::to_vec(&table_metadata).context(metastore_err::SerdeSnafu)?,
             );
 
             let url = url::Url::parse(&table.metadata_location)
-                .context(metastore_error::UrlParseSnafu)?;
+                .context(metastore_err::UrlParseSnafu)?;
             let path = Path::from(url.path());
             object_store
                 .put(&path, PutPayload::from(data))
                 .await
-                .context(metastore_error::ObjectStoreSnafu)?;
+                .context(metastore_err::ObjectStoreSnafu)?;
             Ok(rwo_table)
         } else {
-            Err(metastore_error::SchemaNotFoundSnafu {
+            Err(metastore_err::SchemaNotFoundSnafu {
                 schema: ident.schema.clone(),
                 db: ident.database.clone(),
             }
@@ -614,7 +708,7 @@ impl Metastore for SlateDBMetastore {
             .get_table(ident)
             .await?
             .ok_or_else(|| {
-                metastore_error::TableNotFoundSnafu {
+                metastore_err::TableNotFoundSnafu {
                     table: ident.table.clone(),
                     schema: ident.schema.clone(),
                     db: ident.database.clone(),
@@ -632,7 +726,7 @@ impl Metastore for SlateDBMetastore {
         convert_add_schema_update_to_lowercase(&mut update.updates)?;
 
         apply_table_updates(&mut table.metadata, update.updates)
-            .context(metastore_error::IcebergSnafu)?;
+            .context(metastore_err::IcebergSnafu)?;
 
         let mut properties = table.properties.clone();
         Self::update_properties_timestamps(&mut properties);
@@ -650,13 +744,13 @@ impl Metastore for SlateDBMetastore {
         let rw_table = self.update_object(&key, table.clone()).await?;
 
         let db = self.get_database(&ident.database).await?.ok_or_else(|| {
-            metastore_error::DatabaseNotFoundSnafu {
+            metastore_err::DatabaseNotFoundSnafu {
                 db: ident.database.clone(),
             }
             .build()
         })?;
         let volume = self.get_volume(&db.volume).await?.ok_or_else(|| {
-            metastore_error::VolumeNotFoundSnafu {
+            metastore_err::VolumeNotFoundSnafu {
                 volume: db.volume.clone(),
             }
             .build()
@@ -664,15 +758,15 @@ impl Metastore for SlateDBMetastore {
 
         let object_store = volume.get_object_store()?;
         let data =
-            Bytes::from(serde_json::to_vec(&table.metadata).context(metastore_error::SerdeSnafu)?);
+            Bytes::from(serde_json::to_vec(&table.metadata).context(metastore_err::SerdeSnafu)?);
 
-        let url = url::Url::parse(&metadata_location).context(metastore_error::UrlParseSnafu)?;
+        let url = url::Url::parse(&metadata_location).context(metastore_err::UrlParseSnafu)?;
         let path = Path::from(url.path());
 
         object_store
             .put(&path, PutPayload::from(data))
             .await
-            .context(metastore_error::ObjectStoreSnafu)?;
+            .context(metastore_err::ObjectStoreSnafu)?;
 
         Ok(rw_table)
     }
@@ -682,7 +776,7 @@ impl Metastore for SlateDBMetastore {
         if let Some(table) = self.get_table(ident).await? {
             if cascade {
                 let object_store = self.table_object_store(ident).await?.ok_or_else(|| {
-                    metastore_error::TableObjectStoreNotFoundSnafu {
+                    metastore_err::TableObjectStoreNotFoundSnafu {
                         table: ident.table.clone(),
                         schema: ident.schema.clone(),
                         db: ident.database.clone(),
@@ -690,7 +784,7 @@ impl Metastore for SlateDBMetastore {
                     .build()
                 })?;
                 let url = url::Url::parse(&self.url_for_table(ident).await?)
-                    .context(metastore_error::UrlParseSnafu)?;
+                    .context(metastore_err::UrlParseSnafu)?;
                 let metadata_path = Path::from(url.path());
 
                 // List object
@@ -703,7 +797,7 @@ impl Metastore for SlateDBMetastore {
                     .delete_stream(locations)
                     .try_collect::<Vec<Path>>()
                     .await
-                    .context(metastore_error::ObjectStoreSnafu)?;
+                    .context(metastore_err::ObjectStoreSnafu)?;
             }
 
             if table.is_temporary {
@@ -719,7 +813,7 @@ impl Metastore for SlateDBMetastore {
             );
             self.delete_object(&key).await
         } else {
-            Err(metastore_error::TableNotFoundSnafu {
+            Err(metastore_err::TableNotFoundSnafu {
                 table: ident.table.clone(),
                 schema: ident.schema.clone(),
                 db: ident.database.clone(),
@@ -737,7 +831,7 @@ impl Metastore for SlateDBMetastore {
         self.db
             .get(&key)
             .await
-            .context(metastore_error::UtilSlateDBSnafu)
+            .context(metastore_err::UtilSlateDBSnafu)
     }
 
     #[instrument(name = "Metastore::table_object_store", level = "debug", skip(self))]
@@ -758,7 +852,7 @@ impl Metastore for SlateDBMetastore {
     async fn url_for_table(&self, ident: &TableIdent) -> Result<String> {
         if let Some(tbl) = self.get_table(ident).await? {
             let database = self.get_database(&ident.database).await?.ok_or_else(|| {
-                metastore_error::DatabaseNotFoundSnafu {
+                metastore_err::DatabaseNotFoundSnafu {
                     db: ident.database.clone(),
                 }
                 .build()
@@ -767,7 +861,7 @@ impl Metastore for SlateDBMetastore {
             // Table has a custom volume associated
             if let Some(volume_ident) = tbl.volume_ident.as_ref() {
                 let volume = self.get_volume(volume_ident).await?.ok_or_else(|| {
-                    metastore_error::VolumeNotFoundSnafu {
+                    metastore_err::VolumeNotFoundSnafu {
                         volume: volume_ident.clone(),
                     }
                     .build()
@@ -785,7 +879,7 @@ impl Metastore for SlateDBMetastore {
             }
 
             let volume = self.get_volume(&database.volume).await?.ok_or_else(|| {
-                metastore_error::VolumeNotFoundSnafu {
+                metastore_err::VolumeNotFoundSnafu {
                     volume: database.volume.clone(),
                 }
                 .build()
@@ -804,7 +898,7 @@ impl Metastore for SlateDBMetastore {
             ));
         }
 
-        Err(metastore_error::TableObjectStoreNotFoundSnafu {
+        Err(metastore_err::TableObjectStoreNotFoundSnafu {
             table: ident.table.clone(),
             schema: ident.schema.clone(),
             db: ident.database.clone(),
@@ -824,7 +918,7 @@ impl Metastore for SlateDBMetastore {
             self.get_database(&ident.database)
                 .await?
                 .ok_or_else(|| {
-                    metastore_error::DatabaseNotFoundSnafu {
+                    metastore_err::DatabaseNotFoundSnafu {
                         db: ident.database.clone(),
                     }
                     .build()
@@ -858,7 +952,7 @@ fn convert_schema_fields_to_lowercase(schema: &IcebergSchema) -> Result<IcebergS
         builder.with_struct_field(field);
     }
 
-    builder.build().context(metastore_error::IcebergSpecSnafu)
+    builder.build().context(metastore_err::IcebergSpecSnafu)
 }
 
 fn convert_add_schema_update_to_lowercase(updates: &mut Vec<IcebergTableUpdate>) -> Result<()> {
@@ -913,12 +1007,7 @@ mod tests {
     }
 
     async fn get_metastore() -> SlateDBMetastore {
-        let object_store = object_store::memory::InMemory::new();
-        let sdb = SlateDb::open(Path::from("/"), Arc::new(object_store))
-            .await
-            .expect("Failed to open db");
-        let db = Db::new(Arc::new(sdb));
-        SlateDBMetastore::new(db)
+        SlateDBMetastore::new_in_memory().await
     }
 
     #[tokio::test]
@@ -1176,12 +1265,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn test_tables() {
-        let object_store = Arc::new(object_store::memory::InMemory::new());
-        let sdb = SlateDb::open(Path::from("/"), object_store.clone())
-            .await
-            .expect("Failed to open db");
-        let db = Db::new(Arc::new(sdb));
-        let ms = SlateDBMetastore::new(db);
+        let ms = get_metastore().await;
 
         let schema = IcebergSchema::builder()
             .with_schema_id(0)
@@ -1300,12 +1384,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_temporary_tables() {
-        let object_store = Arc::new(object_store::memory::InMemory::new());
-        let sdb = SlateDb::open(Path::from("/"), object_store.clone())
-            .await
-            .expect("Failed to open db");
-        let db = Db::new(Arc::new(sdb));
-        let ms = SlateDBMetastore::new(db);
+        let ms = get_metastore().await;
 
         let schema = IcebergSchema::builder()
             .with_schema_id(0)
